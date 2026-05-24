@@ -1,5 +1,4 @@
-from typing import List, Tuple, Optional, TYPE_CHECKING
-from pathlib import Path
+from typing import List, Tuple, TYPE_CHECKING
 import logging
 from pydantic import BaseModel
 from pydantic_ai import Agent, ModelRetry
@@ -55,7 +54,17 @@ def _filter_entities(entities: List[str]) -> List[str]:
     return [e for e in entities if '"' not in e]
 
 
-def _build_agent(model_config: "ModelConfig", is_conversation: bool, context: str) -> Agent:
+def _build_agent(
+    model_config: "ModelConfig",
+    is_conversation: bool,
+    context: str,
+    entities: List[str],
+) -> Agent:
+    """Build a PydanticAI Agent for relation extraction.
+
+    Entities are captured in the validator closure before the agent is
+    returned, so there is no need to mutate agent state after construction.
+    """
     template = (
         _CONVERSATION_RELATIONS_SYSTEM_PROMPT_TEMPLATE
         if is_conversation
@@ -82,7 +91,7 @@ def _build_agent(model_config: "ModelConfig", is_conversation: bool, context: st
         retries=2,
     )
 
-    entities_set: set[str] = set()
+    entities_set: set[str] = set(entities)
 
     @agent.output_validator
     def validate_entities(output: RelationsResponse) -> RelationsResponse:
@@ -93,17 +102,15 @@ def _build_agent(model_config: "ModelConfig", is_conversation: bool, context: st
             if r.subject not in entities_set or r.object not in entities_set
         ]
         if bad:
-            bad_subjects = {r.subject for r in bad if r.subject not in entities_set}
-            bad_objects = {r.object for r in bad if r.object not in entities_set}
-            invalid = bad_subjects | bad_objects
+            invalid = {r.subject for r in bad if r.subject not in entities_set} | {
+                r.object for r in bad if r.object not in entities_set
+            }
             raise ModelRetry(
                 f"The following subjects/objects are not in the entities list: {sorted(invalid)}. "
                 "Ensure every subject and object is an exact match to an entity in the list."
             )
         return output
 
-    # Attach entities_set as a mutable cell so the closure captures it
-    agent._entities_set = entities_set  # type: ignore[attr-defined]
     return agent
 
 
@@ -112,9 +119,17 @@ def get_relations(
     entities: List[str],
     is_conversation: bool = False,
     context: str = "",
-    model_config: "ModelConfig" = None,
+    *,
+    model_config: "ModelConfig",
 ) -> Tuple[List[Tuple[str, str, str]], object]:
     """Extract subject-predicate-object relations from text.
+
+    Args:
+        input_data: Text or conversation string to extract relations from.
+        entities: List of entities previously extracted from the same text.
+        is_conversation: Set True when input_data is a formatted conversation.
+        context: Optional description of the data context.
+        model_config: Required — holds model name, API credentials, and settings.
 
     Returns:
         Tuple of (list of (subject, predicate, object) triples, RunUsage)
@@ -122,23 +137,15 @@ def get_relations(
     entities = _filter_entities(entities)
     entities_str = "\n".join(f"- {e}" for e in entities)
 
-    agent = _build_agent(model_config, is_conversation, context)
-    # Populate the entities set that the output_validator closure uses
-    agent._entities_set.update(entities)  # type: ignore[attr-defined]
+    agent = _build_agent(model_config, is_conversation, context, entities)
 
-    user_prompt = f"""
-Here is the list of entities that were previously extracted from the source text:
-
-<entities>
-{entities_str}
-</entities>
-
-Here is the {'conversation' if is_conversation else 'source text'} to analyze:
-
-<{'conversation' if is_conversation else 'text'}>
-{input_data}
-</{'conversation' if is_conversation else 'text'}>
-"""
+    tag = "conversation" if is_conversation else "text"
+    user_prompt = (
+        f"\nHere is the list of entities that were previously extracted from the source text:\n\n"
+        f"<entities>\n{entities_str}\n</entities>\n\n"
+        f"Here is the {tag} to analyze:\n\n"
+        f"<{tag}>\n{input_data}\n</{tag}>\n"
+    )
 
     result = agent.run_sync(user_prompt)
     triples = [(r.subject, r.predicate, r.object) for r in result.output.relations]

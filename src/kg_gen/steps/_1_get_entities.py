@@ -1,5 +1,4 @@
 from typing import List, Tuple, TYPE_CHECKING
-from pathlib import Path
 from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.settings import ModelSettings
@@ -57,22 +56,26 @@ def _build_agent(model_config: "ModelConfig", is_conversation: bool) -> Agent:
 def get_entities(
     input_data: str,
     is_conversation: bool = False,
-    model_config: "ModelConfig" = None,
+    *,
+    model_config: "ModelConfig",
 ) -> Tuple[List[str], object]:
     """Extract entities from text or conversation.
+
+    Args:
+        input_data: Text or conversation string to extract entities from.
+        is_conversation: Set True when input_data is a formatted conversation.
+        model_config: Required — holds model name, API credentials, and settings.
 
     Returns:
         Tuple of (list of entity strings, RunUsage for token accounting)
     """
     agent = _build_agent(model_config, is_conversation)
 
-    user_prompt = f"""
-Here is the {'conversation' if is_conversation else 'text'} to extract entities from:
-
-<{'conversation' if is_conversation else 'article'}>
-{input_data}
-</{'conversation' if is_conversation else 'article'}>
-"""
+    tag = "conversation" if is_conversation else "article"
+    user_prompt = (
+        f"\nHere is the {'conversation' if is_conversation else 'text'} to extract entities from:\n\n"
+        f"<{tag}>\n{input_data}\n</{tag}>\n"
+    )
 
     result = agent.run_sync(user_prompt)
     return result.output.entities, result.usage

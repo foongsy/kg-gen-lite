@@ -115,7 +115,7 @@ class KGGen:
         retrieval_model: str = None,
         api_key: str = None,
         api_base: str = None,
-        disable_cache: bool = None,
+        disable_cache: bool | None = None,
     ):
         """Initialize or reinitialize the model config with new parameters."""
 
@@ -205,13 +205,13 @@ class KGGen:
         else:
             processed_input = input_data
 
-        if any([model, temperature, api_key, api_base, reasoning_effort]):
+        if any(x is not None for x in [model, temperature, api_key, api_base, reasoning_effort]):
             self.init_model(
-                model=model or self.model_config.model,
-                temperature=temperature or self.model_config.temperature,
-                api_key=api_key or self.model_config.api_key,
-                api_base=api_base or self.model_config.api_base,
-                reasoning_effort=reasoning_effort or self.model_config.reasoning_effort,
+                model=model if model is not None else self.model_config.model,
+                temperature=temperature if temperature is not None else self.model_config.temperature,
+                api_key=api_key if api_key is not None else self.model_config.api_key,
+                api_base=api_base if api_base is not None else self.model_config.api_base,
+                reasoning_effort=reasoning_effort if reasoning_effort is not None else self.model_config.reasoning_effort,
             )
 
         cfg = self.model_config
@@ -292,12 +292,12 @@ class KGGen:
         api_base: str = None,
         context: str = "",
     ) -> Graph:
-        if any([model, temperature, api_key, api_base]):
+        if any(x is not None for x in [model, temperature, api_key, api_base]):
             self.init_model(
-                model=model or self.model_config.model,
-                temperature=temperature or self.model_config.temperature,
-                api_key=api_key or self.model_config.api_key,
-                api_base=api_base or self.model_config.api_base,
+                model=model if model is not None else self.model_config.model,
+                temperature=temperature if temperature is not None else self.model_config.temperature,
+                api_key=api_key if api_key is not None else self.model_config.api_key,
+                api_base=api_base if api_base is not None else self.model_config.api_base,
             )
 
         return run_deduplication(

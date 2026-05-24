@@ -76,21 +76,28 @@ _ensure_nltk_resource("tokenizers/punkt", "punkt")
 _ensure_nltk_resource("tokenizers/punkt_tab", "punkt_tab")
 
 
-def chunk_text(text: str, max_chunk_size=500) -> list[str]:
+def chunk_text(text: str, max_chunk_size: int = 500) -> list[str]:
     """Chunk text by sentence, respecting a maximum chunk size.
 
     For CJK-dominant text, splits on CJK sentence-ending punctuation
-    (。！？ etc.) instead of NLTK's Latin-trained tokeniser.
+    instead of NLTK's Latin-trained tokeniser.
     Falls back to character-based chunking if a single CJK sentence is too
-    large, and to word-based chunking for Latin text.
+    large, and to word-based chunking (with single-word splitting) for Latin.
 
     Args:
         text: The text to chunk.
         max_chunk_size: Maximum length (in characters) of any chunk.
+            Must be a positive integer.
 
     Returns:
         A list of text chunks, each at most *max_chunk_size* characters.
+
+    Raises:
+        ValueError: If *max_chunk_size* is not a positive integer.
     """
+    if not isinstance(max_chunk_size, int) or max_chunk_size <= 0:
+        raise ValueError(f"max_chunk_size must be a positive integer, got {max_chunk_size!r}")
+
     if _is_cjk_text(text):
         return _chunk_by_sentences(
             _split_cjk_sentences(text),
@@ -130,10 +137,18 @@ def _chunk_by_sentences(
                     words = sentence.split()
                     temp_chunk = ""
                     for word in words:
-                        if len(temp_chunk) + len(word) + 1 <= max_chunk_size:
+                        if len(word) > max_chunk_size:
+                            # Flush any pending chunk before splitting the word
+                            if temp_chunk:
+                                chunks.append(temp_chunk.strip())
+                                temp_chunk = ""
+                            for start in range(0, len(word), max_chunk_size):
+                                chunks.append(word[start : start + max_chunk_size])
+                        elif len(temp_chunk) + len(word) + 1 <= max_chunk_size:
                             temp_chunk += word + " "
                         else:
-                            chunks.append(temp_chunk.strip())
+                            if temp_chunk:
+                                chunks.append(temp_chunk.strip())
                             temp_chunk = word + " "
                     if temp_chunk:
                         chunks.append(temp_chunk.strip())
