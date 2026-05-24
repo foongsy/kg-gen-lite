@@ -1,109 +1,78 @@
-from typing import List, Optional
+from typing import List, Tuple, TYPE_CHECKING
 from pathlib import Path
-import dspy
-import litellm
 from pydantic import BaseModel
+from pydantic_ai import Agent
+from pydantic_ai.settings import ModelSettings
+from pydantic_ai.models.openai import OpenAIChatModelSettings
+
+if TYPE_CHECKING:
+    from kg_gen.kg_gen import ModelConfig
 
 
-class TextEntities(dspy.Signature):
-    """Extract key entities from the source text. Extracted entities are subjects or objects.
-    This is for an extraction task, please be THOROUGH and accurate to the reference text."""
+_TEXT_SYSTEM_PROMPT = """\
+Extract key entities from the source text. Extracted entities are subjects or objects.
+This is for an extraction task, please be THOROUGH and accurate to the reference text.
 
-    source_text: str = dspy.InputField()
-    entities: list[str] = dspy.OutputField(desc="THOROUGH list of key entities")
+Consider both explicit entities and participants in the conversation when applicable.
+Preserve entity names in their original script (e.g. Chinese, Arabic, Japanese — do not translate).\
+"""
 
+_CONVERSATION_SYSTEM_PROMPT = """\
+Extract key entities from the conversation. Extracted entities are subjects or objects.
+Consider both explicit entities and participants in the conversation.
+This is for an extraction task, please be THOROUGH and accurate.
 
-class ConversationEntities(dspy.Signature):
-    """Extract key entities from the conversation Extracted entities are subjects or objects.
-    Consider both explicit entities and participants in the conversation.
-    This is for an extraction task, please be THOROUGH and accurate."""
-
-    source_text: str = dspy.InputField()
-    entities: list[str] = dspy.OutputField(desc="THOROUGH list of key entities")
+Preserve entity names in their original script (e.g. Chinese, Arabic, Japanese — do not translate).\
+"""
 
 
 class EntitiesResponse(BaseModel):
-    """Structured response for entity extraction."""
+    """A thorough list of key entities extracted from the source text."""
 
     entities: List[str]
 
 
-def _load_entities_prompt() -> str:
-    """Load the entities prompt template from file."""
-    prompt_path = Path(__file__).parent.parent / "prompts" / "entities.txt"
-    return prompt_path.read_text()
+def _build_agent(model_config: "ModelConfig", is_conversation: bool) -> Agent:
+    system_prompt = _CONVERSATION_SYSTEM_PROMPT if is_conversation else _TEXT_SYSTEM_PROMPT
+    pai_model = model_config.build()
 
+    settings: ModelSettings = OpenAIChatModelSettings(
+        temperature=model_config.temperature,
+        max_tokens=model_config.max_tokens,
+        **(
+            {"openai_reasoning_effort": model_config.reasoning_effort}
+            if model_config.reasoning_effort
+            else {}
+        ),
+    )
 
-def _get_entities_litellm(
-    input_data: str,
-    model: str,
-    api_key: Optional[str] = None,
-    api_base: Optional[str] = None,
-    temperature: float = 0.0,
-) -> List[str]:
-    prompt_template = _load_entities_prompt()
-    user_prompt = f"""
-Here is the text to extract entities from:
-
-<article>
-{input_data}
-</article>
-    """
-
-    # Build schema with additionalProperties: false (required by OpenAI)
-    schema = EntitiesResponse.model_json_schema()
-    schema["additionalProperties"] = False
-
-    kwargs = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": prompt_template},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": temperature,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "entities_response",
-                "schema": schema,
-                "strict": True,
-            }
-        },
-    }
-
-    if api_key:
-        kwargs["api_key"] = api_key
-    if api_base:
-        kwargs["api_base"] = api_base
-
-    response = litellm.responses(**kwargs)
-    # print(response.model_dump_json(indent=2))
-    parsed = EntitiesResponse.model_validate_json(response.output[-1].content[0].text)
-    return parsed.entities
+    return Agent(
+        pai_model,
+        output_type=EntitiesResponse,
+        system_prompt=system_prompt,
+        model_settings=settings,
+    )
 
 
 def get_entities(
     input_data: str,
     is_conversation: bool = False,
-    use_litellm_prompt: bool = False,
-    model: Optional[str] = None,
-    api_key: Optional[str] = None,
-    api_base: Optional[str] = None,
-    temperature: float = 0.0,
-) -> List[str]:
-    if use_litellm_prompt and not is_conversation:
-        return _get_entities_litellm(
-            input_data,
-            model=model,
-            api_key=api_key,
-            api_base=api_base,
-            temperature=temperature,
-        )
+    model_config: "ModelConfig" = None,
+) -> Tuple[List[str], object]:
+    """Extract entities from text or conversation.
 
-    extract = (
-        dspy.Predict(ConversationEntities)
-        if is_conversation
-        else dspy.Predict(TextEntities)
-    )
-    result = extract(source_text=input_data)
-    return result.entities
+    Returns:
+        Tuple of (list of entity strings, RunUsage for token accounting)
+    """
+    agent = _build_agent(model_config, is_conversation)
+
+    user_prompt = f"""
+Here is the {'conversation' if is_conversation else 'text'} to extract entities from:
+
+<{'conversation' if is_conversation else 'article'}>
+{input_data}
+</{'conversation' if is_conversation else 'article'}>
+"""
+
+    result = agent.run_sync(user_prompt)
+    return result.output.entities, result.usage

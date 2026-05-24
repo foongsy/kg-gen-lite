@@ -1,5 +1,6 @@
 from typing import Union, List, Dict, Optional
 from typing_extensions import deprecated
+from dataclasses import dataclass, field
 
 from kg_gen.steps._1_get_entities import get_entities
 from kg_gen.steps._2_get_relations import get_relations
@@ -7,7 +8,10 @@ from kg_gen.steps._3_deduplicate import run_deduplication, DeduplicateMethod
 from kg_gen.utils.chunk_text import chunk_text
 from kg_gen.utils.visualize_kg import visualize as visualize_kg
 from kg_gen.models import Graph
-import dspy
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.providers.litellm import LiteLLMProvider
+from pydantic_ai.usage import RunUsage
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,21 +19,52 @@ import networkx as nx
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
-
-# Configure dspy logging to only show errors
 import logging
 
 logger = logging.getLogger(__name__)
 
-dspy_logger = logging.getLogger("dspy")
-dspy_logger.setLevel(logging.CRITICAL)
+
+@dataclass
+class ModelConfig:
+    """Holds all parameters needed to instantiate a PydanticAI model."""
+
+    model: str
+    api_key: Optional[str] = None
+    api_base: Optional[str] = None
+    temperature: float = 0.0
+    max_tokens: int = 16000
+    reasoning_effort: Optional[str] = None
+    disable_cache: bool = False
+
+    def build(self) -> OpenAIChatModel:
+        """Build a PydanticAI OpenAIChatModel from this config.
+
+        Uses LiteLLMProvider when the model name contains a provider prefix
+        (e.g. ``openai/gpt-4o``, ``anthropic/claude-3-5-sonnet-20241022``),
+        which routes the call through LiteLLM just as the original DSPy path
+        did. Falls back to OpenAIProvider for bare model names.
+        """
+        if "/" in self.model:
+            provider = LiteLLMProvider(
+                api_key=self.api_key,
+                api_base=self.api_base,
+            )
+            model_name = self.model
+        else:
+            provider = OpenAIProvider(
+                api_key=self.api_key,
+                base_url=self.api_base,
+            )
+            model_name = self.model
+
+        return OpenAIChatModel(model_name, provider=provider)
 
 
 class KGGen:
     def __init__(
         self,
         model: str = "openai/gpt-4o",
-        max_tokens: int = 16000,  # minimum for gpt-5 family models
+        max_tokens: int = 16000,
         temperature: float = 0.0,
         reasoning_effort: str = None,
         api_key: str = None,
@@ -40,20 +75,17 @@ class KGGen:
         """Initialize KGGen with optional model configuration
 
         Args:
-            model: Name of model to use (e.g. 'gpt-4')
+            model: LiteLLM-style model name (e.g. ``'openai/gpt-4o'``)
+            max_tokens: Maximum tokens for model output
             temperature: Temperature for model sampling
+            reasoning_effort: Reasoning effort for o-series models (``'low'``/``'medium'``/``'high'``)
             api_key: API key for model access
-            api_base: Specify the base URL endpoint for making API calls to a language model service
+            api_base: Custom base URL endpoint for the language model service
+            retrieval_model: SentenceTransformer model name for retrieval/dedup
+            disable_cache: Disable LiteLLM response caching
         """
-        self.model = model
-        self.reasoning_effort = reasoning_effort
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-        self.api_key = api_key
-        self.api_base = api_base
         self.retrieval_model: Optional[SentenceTransformer] = None
-        self.lm = None
-        self.disable_cache = disable_cache
+        self._usage_history: List[RunUsage] = []
 
         self.init_model(
             model=model,
@@ -63,14 +95,15 @@ class KGGen:
             api_key=api_key,
             api_base=api_base,
             retrieval_model=retrieval_model,
+            disable_cache=disable_cache,
         )
 
     def validate_temperature(self, temperature: float):
-        if "gpt-5" in self.model and temperature < 1.0:
+        if "gpt-5" in self.model_config.model and temperature < 1.0:
             raise ValueError("Temperature must be 1.0 for gpt-5 family models")
 
     def validate_max_tokens(self, max_tokens: int):
-        if "gpt-5" in self.model and max_tokens < 16000:
+        if "gpt-5" in self.model_config.model and max_tokens < 16000:
             raise ValueError("Max tokens must be 16000 for gpt-5 family models")
 
     def init_model(
@@ -82,65 +115,34 @@ class KGGen:
         retrieval_model: str = None,
         api_key: str = None,
         api_base: str = None,
+        disable_cache: bool = None,
     ):
-        """Initialize or reinitialize the model with new parameters
+        """Initialize or reinitialize the model config with new parameters."""
 
-        Args:
-            model: Name of model to use (e.g. 'gpt-4')
-            temperature: Temperature for model sampling
-            api_key: API key for model access
-            api_base: API base for model access
-            retrieval_model: Name of retrieval model to use
-            reasoning_effort: Reasoning effort for model
-            max_tokens: Maximum tokens for model
-            temperature: Temperature for model sampling
-        """
+        # Carry forward existing values for unspecified params
+        existing = getattr(self, "model_config", None)
 
-        # Update instance variables if new values provided
-        if model is not None:
-            self.model = model
-        if max_tokens is not None:
-            self.max_tokens = max_tokens
-        if api_key is not None:
-            self.api_key = api_key
-        if api_base is not None:
-            self.api_base = api_base
-        if temperature is not None:
-            self.temperature = temperature
-        if reasoning_effort is not None:
-            self.reasoning_effort = reasoning_effort
+        self.model_config = ModelConfig(
+            model=model if model is not None else (existing.model if existing else "openai/gpt-4o"),
+            api_key=api_key if api_key is not None else (existing.api_key if existing else None),
+            api_base=api_base if api_base is not None else (existing.api_base if existing else None),
+            temperature=temperature if temperature is not None else (existing.temperature if existing else 0.0),
+            max_tokens=max_tokens if max_tokens is not None else (existing.max_tokens if existing else 16000),
+            reasoning_effort=reasoning_effort if reasoning_effort is not None else (existing.reasoning_effort if existing else None),
+            disable_cache=disable_cache if disable_cache is not None else (existing.disable_cache if existing else False),
+        )
+
+        self.validate_temperature(self.model_config.temperature)
+        self.validate_max_tokens(self.model_config.max_tokens)
+
         if retrieval_model is not None:
             self.retrieval_model = SentenceTransformer(retrieval_model)
 
-        self.validate_temperature(self.temperature)
-        self.validate_max_tokens(self.max_tokens)
-
-        # Initialize dspy LM with current settings
-        if self.api_key:
-            self.lm = dspy.LM(
-                model=self.model,
-                api_key=self.api_key,
-                reasoning={"effort": self.reasoning_effort}
-                if self.reasoning_effort
-                else None,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                api_base=self.api_base,
-                cache=not self.disable_cache,
-                model_type="responses" if self.model.startswith("openai/") else "chat",
-            )
-        else:
-            self.lm = dspy.LM(
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                api_base=self.api_base,
-                reasoning={"effort": self.reasoning_effort}
-                if self.reasoning_effort
-                else None,
-                cache=not self.disable_cache,
-                model_type="responses" if self.model.startswith("openai/") else "chat",
-            )
+    # Convenience property kept for backward compatibility with code that
+    # previously accessed ``self.model`` or ``self.lm``.
+    @property
+    def model(self) -> str:
+        return self.model_config.model
 
     @staticmethod
     def from_file(file_path: str) -> Graph:
@@ -164,26 +166,29 @@ class KGGen:
         deduplication_method: DeduplicateMethod | None = DeduplicateMethod.SEMHASH,
         temperature: float = None,
         output_folder: Optional[str] = None,
+        # Kept for backward compatibility; PydanticAI is now always used.
         no_dspy: bool = False,
     ) -> Graph:
         """Generate a knowledge graph from input text or messages.
 
         Args:
             input_data: Text string or list of message dicts
-            model: Name of OpenAI model to use
-            api_key (str): OpenAI API key for making model calls
-            chunk_size: Max size of text chunks in characters to process
+            model: Override the model for this call
+            api_key: Override the API key for this call
+            api_base: Override the API base for this call
             context: Description of data context
+            chunk_size: Max size of text chunks in characters to process
+            reasoning_effort: Reasoning effort for o-series models
+            deduplication_method: Deduplication strategy (default: SEMHASH)
+            temperature: Override temperature for this call
             output_folder: Path to save partial progress
+            no_dspy: Deprecated; kept for backward compatibility only
 
         Returns:
             Graph: Generated knowledge graph
         """
-
-        # Process input data
         is_conversation = isinstance(input_data, list)
         if is_conversation:
-            # Extract text from messages
             text_content = []
             for message in input_data:
                 if (
@@ -196,52 +201,40 @@ class KGGen:
                     )
                 if message["role"] in ["user", "assistant"]:
                     text_content.append(f"{message['role']}: {message['content']}")
-
-            # Join with newlines to preserve message boundaries
             processed_input = "\n".join(text_content)
         else:
             processed_input = input_data
 
-        # Reinitialize dspy with new parameters if any are provided
         if any([model, temperature, api_key, api_base, reasoning_effort]):
             self.init_model(
-                model=model or self.model,
-                temperature=temperature or self.temperature,
-                api_key=api_key or self.api_key,
-                api_base=api_base or self.api_base,
-                reasoning_effort=reasoning_effort or self.reasoning_effort,
+                model=model or self.model_config.model,
+                temperature=temperature or self.model_config.temperature,
+                api_key=api_key or self.model_config.api_key,
+                api_base=api_base or self.model_config.api_base,
+                reasoning_effort=reasoning_effort or self.model_config.reasoning_effort,
             )
 
-        def _process(content, lm):
-            with dspy.context(lm=lm):
-                entities = get_entities(
-                    content,
-                    is_conversation,
-                    use_litellm_prompt=no_dspy,
-                    model=self.model,
-                    api_key=self.api_key,
-                    api_base=self.api_base,
-                    temperature=temperature
-                    if temperature is not None
-                    else self.temperature,
-                )
-                relations = get_relations(
-                    content,
-                    entities,
-                    is_conversation=is_conversation,
-                    use_litellm_prompt=no_dspy,
-                    model=self.model,
-                    api_key=self.api_key,
-                    api_base=self.api_base,
-                    temperature=temperature
-                    if temperature is not None
-                    else self.temperature,
-                )
-                return entities, relations
+        cfg = self.model_config
+
+        def _process(content: str):
+            entities, e_usage = get_entities(
+                content,
+                is_conversation=is_conversation,
+                model_config=cfg,
+            )
+            relations, r_usage = get_relations(
+                content,
+                entities,
+                is_conversation=is_conversation,
+                context=context,
+                model_config=cfg,
+            )
+            self._usage_history.extend([e_usage, r_usage])
+            return entities, relations
 
         if not chunk_size:
             try:
-                entities, relations = _process(processed_input, self.lm)
+                entities, relations = _process(processed_input)
             except Exception as e:
                 if "context length" in str(e).lower():
                     logger.warning(
@@ -258,9 +251,8 @@ class KGGen:
 
             with ThreadPoolExecutor() as executor:
                 future_to_chunk = {
-                    executor.submit(_process, chunk, self.lm): chunk for chunk in chunks
+                    executor.submit(_process, chunk): chunk for chunk in chunks
                 }
-
                 for future in as_completed(future_to_chunk):
                     chunk_entities, chunk_relations = future.result()
                     entities.update(chunk_entities)
@@ -293,24 +285,23 @@ class KGGen:
         self,
         graph: Graph,
         method: DeduplicateMethod = DeduplicateMethod.FULL,
-        semhash_similarity_threshold: float = 0.95,  # recommended to keep at 0.95
+        semhash_similarity_threshold: float = 0.95,
         model: str = None,
         temperature: float = None,
         api_key: str = None,
         api_base: str = None,
-        context: str = "",  # TODO: implement context
+        context: str = "",
     ) -> Graph:
-        # Reinitialize dspy with new parameters if any are provided
         if any([model, temperature, api_key, api_base]):
             self.init_model(
-                model=model or self.model,
-                temperature=temperature or self.temperature,
-                api_key=api_key or self.api_key,
-                api_base=api_base or self.api_base,
+                model=model or self.model_config.model,
+                temperature=temperature or self.model_config.temperature,
+                api_key=api_key or self.model_config.api_key,
+                api_base=api_base or self.model_config.api_base,
             )
 
         return run_deduplication(
-            lm=self.lm,
+            model_config=self.model_config,
             graph=graph,
             method=method,
             retrieval_model=self.retrieval_model,
@@ -318,13 +309,11 @@ class KGGen:
         )
 
     def aggregate(self, graphs: list[Graph]) -> Graph:
-        # Initialize empty sets for combined graph
         all_entities = set()
         all_relations = set()
         all_edges = set()
         all_entity_metadata: dict[str, set[str]] = {}
 
-        # Combine all graphs
         for graph in graphs:
             all_entities.update(graph.entities)
             all_relations.update(graph.relations)
@@ -336,7 +325,6 @@ class KGGen:
                     else:
                         all_entity_metadata[entity] = metadata_set.copy()
 
-        # Create and return aggregated graph
         return Graph(
             entities=all_entities,
             relations=all_relations,
@@ -364,7 +352,6 @@ class KGGen:
         G = nx.DiGraph()
         for entity in graph.entities:
             G.add_node(entity)
-
         for relation in graph.relations:
             source, rel, target = relation
             G.add_edge(source, target, relation=rel)
@@ -382,7 +369,6 @@ class KGGen:
         node_embeddings = {node: model.encode(node).tolist() for node in graph.nodes}
         relation_embeddings = {
             rel: model.encode(rel).tolist()
-            # TODO: this is triggering index out of range error
             for rel in set(edge[2]["relation"] for edge in graph.edges(data=True))
         }
         return node_embeddings, relation_embeddings
@@ -432,12 +418,10 @@ class KGGen:
         def explore_neighbors(current_node, current_depth):
             if current_depth > depth:
                 return
-            # Outgoing edges
             for neighbor in graph.neighbors(current_node):
                 rel = graph[current_node][neighbor]["relation"]
                 context.add(f"{current_node} {rel} {neighbor}.")
                 explore_neighbors(neighbor, current_depth + 1)
-            # Incoming edges
             for neighbor in graph.predecessors(current_node):
                 rel = graph[neighbor][current_node]["relation"]
                 context.add(f"{neighbor} {rel} {current_node}.")
@@ -461,33 +445,22 @@ class KGGen:
             else None,
             "entity_metadata": graph.entity_metadata,
         }
-
         with open(output_path, "w") as f:
             json.dump(graph_dict, f, indent=2)
 
     # ====== Token Usage ======
+
     def reset_token_usage(self):
-        self.lm.history = []
+        """Reset accumulated token usage counters."""
+        self._usage_history = []
 
     def extract_token_usage_from_history(self) -> Dict[str, int]:
-        """Extract token usage from dspy LM history."""
-
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-        total_tokens = 0
-
-        for entry in self.lm.history:
-            if isinstance(entry, dict):
-                # Check for usage information in various possible locations
-                usage = entry.get("usage") or entry.get("response", {}).get("usage")
-
-                if usage:
-                    total_prompt_tokens += usage.get("prompt_tokens", 0)
-                    total_completion_tokens += usage.get("completion_tokens", 0)
-                    total_tokens += usage.get("total_tokens", 0)
-
+        """Sum token usage across all calls made since the last reset."""
+        total_input = sum(u.input_tokens for u in self._usage_history)
+        total_output = sum(u.output_tokens for u in self._usage_history)
+        total = total_input + total_output
         return {
-            "prompt_tokens": total_prompt_tokens,
-            "completion_tokens": total_completion_tokens,
-            "total_tokens": total_tokens,
+            "prompt_tokens": total_input,
+            "completion_tokens": total_output,
+            "total_tokens": total,
         }

@@ -1,65 +1,145 @@
+"""Text chunking with non-Latin (CJK) support.
+
+Non-Latin text support (step 1 of 3):
+    NLTK's sentence tokenizer is trained on Latin-script corpora and has no
+    word-boundary signal for Chinese/Japanese/Korean text.  This module
+    detects CJK-dominant input and falls back to punctuation-based splitting
+    using the sentence-ending characters common to those scripts.
+"""
+
 import argparse
+import re
 import nltk
 
 
-# Ensure the punkt tokenizer is downloaded
-def ensure_nltk_resource(resource_path, resource_name):
+_CJK_SENTENCE_ENDING = re.compile(
+    r"([。！？…；\n]+(?:\s*))"  # Chinese/Japanese sentence terminators
+    r"|([।\n]+(?:\s*))"         # Devanagari (Hindi, etc.) Danda
+)
+
+# Unicode ranges used for CJK detection (mirrors llm_deduplicate._CJK_RANGES)
+_CJK_RANGES = (
+    (0x4E00, 0x9FFF),
+    (0x3400, 0x4DBF),
+    (0xF900, 0xFAFF),
+    (0x3040, 0x309F),
+    (0x30A0, 0x30FF),
+    (0xAC00, 0xD7AF),
+)
+
+
+def _is_cjk_char(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in _CJK_RANGES)
+
+
+def _is_cjk_text(text: str, threshold: float = 0.10) -> bool:
+    """Return True if more than *threshold* fraction of characters are CJK."""
+    if not text:
+        return False
+    cjk_count = sum(1 for c in text if _is_cjk_char(ord(c)))
+    return cjk_count / len(text) > threshold
+
+
+def _split_cjk_sentences(text: str) -> list[str]:
+    """Split CJK text on sentence-ending punctuation.
+
+    Re-attaches the terminator to the preceding sentence so each chunk
+    includes its trailing punctuation (mirrors how NLTK returns sentences).
+    """
+    parts = _CJK_SENTENCE_ENDING.split(text)
+    sentences: list[str] = []
+    current = ""
+    for part in parts:
+        if part is None:
+            continue
+        if _CJK_SENTENCE_ENDING.fullmatch(part):
+            current += part
+            if current.strip():
+                sentences.append(current.strip())
+            current = ""
+        else:
+            current += part
+    if current.strip():
+        sentences.append(current.strip())
+    return sentences or [text]
+
+
+# Ensure NLTK punkt tokenizer is available for Latin-script text.
+def _ensure_nltk_resource(resource_path, resource_name):
     try:
         nltk.data.find(resource_path)
     except LookupError:
         nltk.download(resource_name, quiet=True)
 
 
-ensure_nltk_resource("tokenizers/punkt", "punkt")
-ensure_nltk_resource("tokenizers/punkt_tab", "punkt_tab")
+_ensure_nltk_resource("tokenizers/punkt", "punkt")
+_ensure_nltk_resource("tokenizers/punkt_tab", "punkt_tab")
 
 
 def chunk_text(text: str, max_chunk_size=500) -> list[str]:
-    """
-    Chunk text by sentence, respecting a maximum chunk size.
-    Falls back to word-based chunking if a single sentence is too large.
+    """Chunk text by sentence, respecting a maximum chunk size.
 
-    :param text: The text to chunk.
-    :param max_chunk_size: The maximum length (in characters) of any chunk.
-    :return: A list of text chunks.
-    """
-    # Step 1: Split text into sentences
-    sentences = nltk.sent_tokenize(text)
+    For CJK-dominant text, splits on CJK sentence-ending punctuation
+    (。！？ etc.) instead of NLTK's Latin-trained tokeniser.
+    Falls back to character-based chunking if a single CJK sentence is too
+    large, and to word-based chunking for Latin text.
 
-    chunks = []
+    Args:
+        text: The text to chunk.
+        max_chunk_size: Maximum length (in characters) of any chunk.
+
+    Returns:
+        A list of text chunks, each at most *max_chunk_size* characters.
+    """
+    if _is_cjk_text(text):
+        return _chunk_by_sentences(
+            _split_cjk_sentences(text),
+            max_chunk_size,
+            cjk=True,
+        )
+    else:
+        return _chunk_by_sentences(
+            nltk.sent_tokenize(text),
+            max_chunk_size,
+            cjk=False,
+        )
+
+
+def _chunk_by_sentences(
+    sentences: list[str], max_chunk_size: int, cjk: bool
+) -> list[str]:
+    """Accumulate *sentences* into chunks bounded by *max_chunk_size* chars."""
+    chunks: list[str] = []
     current_chunk = ""
 
     for sentence in sentences:
-        # If adding this sentence stays within the limit, append it.
-        if len(current_chunk) + len(sentence) + 1 <= max_chunk_size:
-            current_chunk += sentence + " "
+        separator = "" if cjk else " "
+        if len(current_chunk) + len(sentence) + len(separator) <= max_chunk_size:
+            current_chunk += sentence + separator
         else:
-            # If the current chunk has some content, push it and start a new one.
             if current_chunk:
                 chunks.append(current_chunk.strip())
                 current_chunk = ""
 
-            # Check if the sentence itself is larger than the limit.
-            # If yes, chunk it by words (fallback).
             if len(sentence) > max_chunk_size:
-                words = sentence.split()
-                temp_chunk = ""
-
-                for word in words:
-                    if len(temp_chunk) + len(word) + 1 <= max_chunk_size:
-                        temp_chunk += word + " "
-                    else:
+                # Sentence too large — split by character (CJK) or word (Latin)
+                if cjk:
+                    for start in range(0, len(sentence), max_chunk_size):
+                        chunks.append(sentence[start : start + max_chunk_size])
+                else:
+                    words = sentence.split()
+                    temp_chunk = ""
+                    for word in words:
+                        if len(temp_chunk) + len(word) + 1 <= max_chunk_size:
+                            temp_chunk += word + " "
+                        else:
+                            chunks.append(temp_chunk.strip())
+                            temp_chunk = word + " "
+                    if temp_chunk:
                         chunks.append(temp_chunk.strip())
-                        temp_chunk = word + " "
-
-                # Add the leftover if any
-                if temp_chunk:
-                    chunks.append(temp_chunk.strip())
             else:
-                # If the sentence is smaller than max_chunk_size, just start a new chunk with it.
-                current_chunk = sentence + " "
+                current_chunk = sentence + separator
 
-    # If there's a leftover chunk that didn't get pushed, add it
     if current_chunk:
         chunks.append(current_chunk.strip())
 
@@ -84,19 +164,14 @@ def main():
     )
     args = parser.parse_args()
 
-    # Read the input text
     if args.input_file:
         with open(args.input_file, "r", encoding="utf-8") as f:
             text = f.read()
     else:
         import sys
-
         text = sys.stdin.read()
 
-    # Chunk the text
     result_chunks = chunk_text(text, max_chunk_size=args.max_chunk_size)
-
-    # Print or otherwise process the chunks
     for i, chunk in enumerate(result_chunks, start=1):
         print(f"--- Chunk {i} (length {len(chunk)}): ---")
         print(chunk)
