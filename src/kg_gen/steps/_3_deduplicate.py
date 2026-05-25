@@ -21,12 +21,15 @@ def run_deduplication(
     method: DeduplicateMethod = DeduplicateMethod.FULL,
     retrieval_model: SentenceTransformer | None = None,
     semhash_similarity_threshold: float = 0.95,
+    semhash_model: str | None = None,
 ) -> Graph:
     if method != DeduplicateMethod.SEMHASH and retrieval_model is None:
         raise ValueError("No retrieval model provided")
 
     if method == DeduplicateMethod.SEMHASH:
-        return run_semhash_deduplication(graph, semhash_similarity_threshold)
+        return run_semhash_deduplication(
+            graph, semhash_similarity_threshold, semhash_model=semhash_model
+        )
 
     if method == DeduplicateMethod.LM_BASED:
         llm_deduplicate = LLMDeduplicate(retrieval_model, model_config, graph)
@@ -34,7 +37,9 @@ def run_deduplication(
         return llm_deduplicate.deduplicate()
 
     # FULL: semhash first, then LLM
-    deduplicated_graph = run_semhash_deduplication(graph, semhash_similarity_threshold)
+    deduplicated_graph = run_semhash_deduplication(
+        graph, semhash_similarity_threshold, semhash_model=semhash_model
+    )
     llm_deduplicate = LLMDeduplicate(retrieval_model, model_config, deduplicated_graph)
     llm_deduplicate.cluster()
     return llm_deduplicate.deduplicate()

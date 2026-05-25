@@ -1,6 +1,6 @@
 from typing import Union, List, Dict, Optional
 from typing_extensions import deprecated
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from kg_gen.steps._1_get_entities import get_entities
 from kg_gen.steps._2_get_relations import get_relations
@@ -11,7 +11,9 @@ from kg_gen.models import Graph
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.providers.litellm import LiteLLMProvider
+from pydantic_ai.providers.vercel import VercelProvider
 from pydantic_ai.usage import RunUsage
+import httpx
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -22,6 +24,29 @@ import numpy as np
 import logging
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_HTTP_TIMEOUT = httpx.Timeout(timeout=600, connect=5)
+_DEFAULT_KGGEN_SEMHASH_MODEL = "minishlab/potion-multilingual-128M"
+
+
+def _http_client(ssl_verify: bool) -> httpx.AsyncClient | None:
+    """Return a custom httpx client when SSL verification is disabled."""
+    if ssl_verify:
+        return None
+    return httpx.AsyncClient(verify=False, timeout=_DEFAULT_HTTP_TIMEOUT)
+
+
+def _parse_vercel_model(model: str) -> str | None:
+    """Return the gateway model name if *model* uses a Vercel route, else None."""
+    if model.startswith("vercel:"):
+        return model.removeprefix("vercel:")
+    if model.startswith("vercel_ai_gateway/"):
+        return model.removeprefix("vercel_ai_gateway/")
+    return None
+
+
+def _env_semhash_model() -> str:
+    return os.getenv("SEMHASH_MODEL", _DEFAULT_KGGEN_SEMHASH_MODEL)
 
 
 @dataclass
@@ -35,25 +60,47 @@ class ModelConfig:
     max_tokens: int = 16000
     reasoning_effort: Optional[str] = None
     disable_cache: bool = False
+    ssl_verify: bool = True
 
     def build(self) -> OpenAIChatModel:
         """Build a PydanticAI OpenAIChatModel from this config.
 
+        Uses VercelProvider when the model uses a Vercel route prefix:
+
+        - ``vercel:openai/gpt-5.4-mini`` (pydantic-ai native)
+        - ``vercel_ai_gateway/openai/gpt-5.4-mini`` (legacy alias)
+
+        Both route to the Vercel AI Gateway at ``https://ai-gateway.vercel.sh/v1``.
+
         Uses LiteLLMProvider when the model name contains a provider prefix
-        (e.g. ``openai/gpt-4o``, ``anthropic/claude-3-5-sonnet-20241022``),
-        which routes the call through LiteLLM just as the original DSPy path
-        did. Falls back to OpenAIProvider for bare model names.
+        (e.g. ``openai/gpt-4o``, ``anthropic/claude-3-5-sonnet-20241022``).
+        For custom gateways, pass ``api_base`` explicitly. Falls back to
+        OpenAIProvider for bare model names.
+
+        Set ``ssl_verify=False`` to disable TLS certificate verification on the
+        underlying httpx client (e.g. behind a corporate TLS-inspecting proxy).
         """
-        if "/" in self.model:
+        http_client = _http_client(self.ssl_verify)
+        provider_kwargs = (
+            {"http_client": http_client} if http_client is not None else {}
+        )
+
+        vercel_model = _parse_vercel_model(self.model)
+        if vercel_model is not None:
+            provider = VercelProvider(api_key=self.api_key, **provider_kwargs)
+            model_name = vercel_model
+        elif "/" in self.model:
             provider = LiteLLMProvider(
                 api_key=self.api_key,
                 api_base=self.api_base,
+                **provider_kwargs,
             )
             model_name = self.model
         else:
             provider = OpenAIProvider(
                 api_key=self.api_key,
                 base_url=self.api_base,
+                **provider_kwargs,
             )
             model_name = self.model
 
@@ -70,7 +117,9 @@ class KGGen:
         api_key: str = None,
         api_base: str = None,
         retrieval_model: Optional[str] = None,
+        semhash_model: Optional[str] = None,
         disable_cache: bool = False,
+        ssl_verify: bool = True,
     ):
         """Initialize KGGen with optional model configuration
 
@@ -82,7 +131,9 @@ class KGGen:
             api_key: API key for model access
             api_base: Custom base URL endpoint for the language model service
             retrieval_model: SentenceTransformer model name for retrieval/dedup
+            semhash_model: model2vec StaticModel HF id for SEMHASH deduplication
             disable_cache: Disable LiteLLM response caching
+            ssl_verify: Verify TLS certificates for LLM HTTP requests
         """
         self.retrieval_model: Optional[SentenceTransformer] = None
         self._usage_history: List[RunUsage] = []
@@ -95,7 +146,9 @@ class KGGen:
             api_key=api_key,
             api_base=api_base,
             retrieval_model=retrieval_model,
+            semhash_model=semhash_model,
             disable_cache=disable_cache,
+            ssl_verify=ssl_verify,
         )
 
     def validate_temperature(self, temperature: float):
@@ -113,9 +166,11 @@ class KGGen:
         max_tokens: int = None,
         temperature: float = None,
         retrieval_model: str = None,
+        semhash_model: str = None,
         api_key: str = None,
         api_base: str = None,
         disable_cache: bool | None = None,
+        ssl_verify: bool | None = None,
     ):
         """Initialize or reinitialize the model config with new parameters."""
 
@@ -123,17 +178,40 @@ class KGGen:
         existing = getattr(self, "model_config", None)
 
         self.model_config = ModelConfig(
-            model=model if model is not None else (existing.model if existing else "openai/gpt-4o"),
-            api_key=api_key if api_key is not None else (existing.api_key if existing else None),
-            api_base=api_base if api_base is not None else (existing.api_base if existing else None),
-            temperature=temperature if temperature is not None else (existing.temperature if existing else 0.0),
-            max_tokens=max_tokens if max_tokens is not None else (existing.max_tokens if existing else 16000),
-            reasoning_effort=reasoning_effort if reasoning_effort is not None else (existing.reasoning_effort if existing else None),
-            disable_cache=disable_cache if disable_cache is not None else (existing.disable_cache if existing else False),
+            model=model
+            if model is not None
+            else (existing.model if existing else "openai/gpt-4o"),
+            api_key=api_key
+            if api_key is not None
+            else (existing.api_key if existing else None),
+            api_base=api_base
+            if api_base is not None
+            else (existing.api_base if existing else None),
+            temperature=temperature
+            if temperature is not None
+            else (existing.temperature if existing else 0.0),
+            max_tokens=max_tokens
+            if max_tokens is not None
+            else (existing.max_tokens if existing else 16000),
+            reasoning_effort=reasoning_effort
+            if reasoning_effort is not None
+            else (existing.reasoning_effort if existing else None),
+            disable_cache=disable_cache
+            if disable_cache is not None
+            else (existing.disable_cache if existing else False),
+            ssl_verify=ssl_verify
+            if ssl_verify is not None
+            else (existing.ssl_verify if existing else True),
         )
 
         self.validate_temperature(self.model_config.temperature)
         self.validate_max_tokens(self.model_config.max_tokens)
+
+        self.semhash_model = (
+            semhash_model
+            if semhash_model is not None
+            else getattr(self, "semhash_model", None) or _env_semhash_model()
+        )
 
         if retrieval_model is not None:
             self.retrieval_model = SentenceTransformer(retrieval_model)
@@ -166,6 +244,9 @@ class KGGen:
         deduplication_method: DeduplicateMethod | None = DeduplicateMethod.SEMHASH,
         temperature: float = None,
         output_folder: Optional[str] = None,
+        ssl_verify: Optional[bool] = None,
+        semhash_model: str = None,
+        semhash_similarity_threshold: float = 0.95,
         # Kept for backward compatibility; PydanticAI is now always used.
         no_dspy: bool = False,
     ) -> Graph:
@@ -182,6 +263,9 @@ class KGGen:
             deduplication_method: Deduplication strategy (default: SEMHASH)
             temperature: Override temperature for this call
             output_folder: Path to save partial progress
+            ssl_verify: Override TLS certificate verification for LLM requests
+            semhash_model: Override model2vec StaticModel HF id for SEMHASH dedup
+            semhash_similarity_threshold: Similarity threshold for SEMHASH dedup
             no_dspy: Deprecated; kept for backward compatibility only
 
         Returns:
@@ -205,13 +289,36 @@ class KGGen:
         else:
             processed_input = input_data
 
-        if any(x is not None for x in [model, temperature, api_key, api_base, reasoning_effort]):
+        if any(
+            x is not None
+            for x in [
+                model,
+                temperature,
+                api_key,
+                api_base,
+                reasoning_effort,
+                ssl_verify,
+                semhash_model,
+            ]
+        ):
             self.init_model(
                 model=model if model is not None else self.model_config.model,
-                temperature=temperature if temperature is not None else self.model_config.temperature,
+                temperature=temperature
+                if temperature is not None
+                else self.model_config.temperature,
                 api_key=api_key if api_key is not None else self.model_config.api_key,
-                api_base=api_base if api_base is not None else self.model_config.api_base,
-                reasoning_effort=reasoning_effort if reasoning_effort is not None else self.model_config.reasoning_effort,
+                api_base=api_base
+                if api_base is not None
+                else self.model_config.api_base,
+                reasoning_effort=reasoning_effort
+                if reasoning_effort is not None
+                else self.model_config.reasoning_effort,
+                ssl_verify=ssl_verify
+                if ssl_verify is not None
+                else self.model_config.ssl_verify,
+                semhash_model=semhash_model
+                if semhash_model is not None
+                else self.semhash_model,
             )
 
         cfg = self.model_config
@@ -266,7 +373,11 @@ class KGGen:
 
         if deduplication_method:
             graph = self.deduplicate(
-                graph, method=deduplication_method, context=context
+                graph,
+                method=deduplication_method,
+                context=context,
+                semhash_model=semhash_model,
+                semhash_similarity_threshold=semhash_similarity_threshold,
             )
 
         if output_folder:
@@ -286,18 +397,33 @@ class KGGen:
         graph: Graph,
         method: DeduplicateMethod = DeduplicateMethod.FULL,
         semhash_similarity_threshold: float = 0.95,
+        semhash_model: str = None,
         model: str = None,
         temperature: float = None,
         api_key: str = None,
         api_base: str = None,
         context: str = "",
+        ssl_verify: Optional[bool] = None,
     ) -> Graph:
-        if any(x is not None for x in [model, temperature, api_key, api_base]):
+        if any(
+            x is not None
+            for x in [model, temperature, api_key, api_base, ssl_verify, semhash_model]
+        ):
             self.init_model(
                 model=model if model is not None else self.model_config.model,
-                temperature=temperature if temperature is not None else self.model_config.temperature,
+                temperature=temperature
+                if temperature is not None
+                else self.model_config.temperature,
                 api_key=api_key if api_key is not None else self.model_config.api_key,
-                api_base=api_base if api_base is not None else self.model_config.api_base,
+                api_base=api_base
+                if api_base is not None
+                else self.model_config.api_base,
+                ssl_verify=ssl_verify
+                if ssl_verify is not None
+                else self.model_config.ssl_verify,
+                semhash_model=semhash_model
+                if semhash_model is not None
+                else self.semhash_model,
             )
 
         return run_deduplication(
@@ -306,6 +432,7 @@ class KGGen:
             method=method,
             retrieval_model=self.retrieval_model,
             semhash_similarity_threshold=semhash_similarity_threshold,
+            semhash_model=self.semhash_model,
         )
 
     def aggregate(self, graphs: list[Graph]) -> Graph:

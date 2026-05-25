@@ -1,7 +1,23 @@
+from dotenv import load_dotenv
 from kg_gen.models import Graph  # noqa: F401
 from kg_gen import KGGen
 import json  # noqa: F401
 import os  # noqa: F401
+
+load_dotenv()
+
+MODEL = os.getenv(
+    "LLM_MODEL",
+    "vercel_ai_gateway/google/gemini-3.5-flash",
+)
+API_KEY = os.getenv("LLM_API_KEY")
+TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "1.0"))
+REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "minimal") or None
+
+
+def _env_ssl_verify() -> bool:
+    return os.getenv("LLM_SSL_VERIFY", "true").lower() not in ("false", "0", "no")
+
 
 text = """
 A Place for Demons
@@ -26,16 +42,16 @@ most likely remain “boy” until his beard filled out or he bloodied someone�
 nose over the matter.
 """
 
-kg = KGGen()
+kg = KGGen(ssl_verify=_env_ssl_verify())
 # with open("tests/data/kingkiller_chapter_one.txt", "r", encoding="utf-8") as f:
 #     text = f.read()
 
 graph = kg.generate(
     input_data=text,
-    model="openai/gpt-5-nano",
-    api_key=os.getenv("OPENAI_API_KEY"),
-    temperature=1.0,
-    reasoning_effort="minimal",
+    model=MODEL,
+    api_key=API_KEY,
+    temperature=TEMPERATURE,
+    reasoning_effort=REASONING_EFFORT,
     context="Kingkiller Chronicles",
     output_folder="./examples/",
     no_dspy=True,

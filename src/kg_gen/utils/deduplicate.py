@@ -1,7 +1,21 @@
 import unicodedata
+from typing import TYPE_CHECKING
+
 from kg_gen.models import Graph
+from kg_gen.utils.text import is_cjk_text
 from semhash import SemHash
 import inflect
+
+if TYPE_CHECKING:
+    from semhash.utils import Encoder
+
+_DEFAULT_SEMHASH_MODEL = "minishlab/potion-base-8M"
+
+
+def _load_semhash_encoder(model_name: str | None) -> "Encoder":
+    from model2vec import StaticModel
+
+    return StaticModel.from_pretrained(model_name or _DEFAULT_SEMHASH_MODEL)
 
 
 class DeduplicateList:
@@ -17,8 +31,15 @@ class DeduplicateList:
     duplicate_items: int
     reduction: float
 
-    def __init__(self, threshold: float = 0.95):
+    def __init__(
+        self,
+        threshold: float = 0.95,
+        semhash_model: str | None = None,
+        semhash_encoder: "Encoder | None" = None,
+    ):
         self.threshold = threshold
+        self.semhash_model = semhash_model
+        self.semhash_encoder = semhash_encoder
         self.inflect_engine = inflect.engine()
         self.original_map = {}
         self.items_map = {}
@@ -35,6 +56,9 @@ class DeduplicateList:
         """
         Singularize a text.
         """
+        if is_cjk_text(text):
+            return text
+
         # singularize each token when it looks like a plural noun
         tokens = []
         for tok in text.split():
@@ -64,8 +88,15 @@ class DeduplicateList:
             self.items_map[singular] = item
             normalized_items.add(singular)
 
+        encoder = self.semhash_encoder
+        if encoder is None:
+            encoder = _load_semhash_encoder(self.semhash_model)
+
         # Deduplicate the normalized strings
-        semhash = SemHash.from_records(records=list(normalized_items))
+        semhash = SemHash.from_records(
+            records=list(normalized_items),
+            model=encoder,
+        )
         deduplication_result = semhash.self_deduplicate(threshold=self.threshold)
 
         self.deduplicated_items = len(deduplication_result.selected)
@@ -84,7 +115,7 @@ class DeduplicateList:
             ):
                 duplicate_value = duplicate.duplicates[0][0]
                 self.items_map[original] = self.items_map[duplicate_value]
-                if not original in self.duplicates:
+                if original not in self.duplicates:
                     self.duplicates[original] = duplicate_value
 
         self.deduplicated = deduplication_result.selected
@@ -96,14 +127,17 @@ class DeduplicateList:
 def run_semhash_deduplication(
     graph: Graph,
     similarity_threshold: float = 0.95,
+    semhash_model: str | None = None,
 ) -> Graph:
     """
     Deduplicate the graph.
     """
+    encoder = _load_semhash_encoder(semhash_model)
+
     # Deduplicate each graph components
-    entities_dedup = DeduplicateList(similarity_threshold)
+    entities_dedup = DeduplicateList(similarity_threshold, semhash_encoder=encoder)
     entities_dedup.deduplicate(graph.entities)
-    edges_dedup = DeduplicateList(similarity_threshold)
+    edges_dedup = DeduplicateList(similarity_threshold, semhash_encoder=encoder)
     edges_dedup.deduplicate(graph.edges)
 
     def _get_relation(relation: list[str]) -> list[str]:
