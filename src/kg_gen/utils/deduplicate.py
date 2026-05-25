@@ -9,7 +9,7 @@ import inflect
 if TYPE_CHECKING:
     from semhash.utils import Encoder
 
-_DEFAULT_SEMHASH_MODEL = "minishlab/potion-base-8M"
+_DEFAULT_SEMHASH_MODEL = "minishlab/potion-multilingual-128M"
 
 
 def _load_semhash_encoder(model_name: str | None) -> "Encoder":
@@ -136,9 +136,11 @@ def run_semhash_deduplication(
 
     # Deduplicate each graph components
     entities_dedup = DeduplicateList(similarity_threshold, semhash_encoder=encoder)
-    entities_dedup.deduplicate(graph.entities)
+    if graph.entities:
+        entities_dedup.deduplicate(graph.entities)
     edges_dedup = DeduplicateList(similarity_threshold, semhash_encoder=encoder)
-    edges_dedup.deduplicate(graph.edges)
+    if graph.edges:
+        edges_dedup.deduplicate(graph.edges)
 
     def _get_relation(relation: list[str]) -> list[str]:
         """
