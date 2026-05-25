@@ -50,3 +50,9 @@ Before providing your final output, work through your analysis systematically in
    - Consider whether there are any relationships you can extract
 
 5. **Finalize triples**: Create your final list of verified triples to include in your output.
+
+## Language and Script
+
+- The source text may be in any language or script (e.g. Simplified Chinese, Arabic, Japanese, Hindi).
+- **Do not translate** entity names or predicates. Return them in the same script and form they appear in the source text.
+- Predicates should be concise phrases that faithfully describe the relationship as stated in the text, in the same language as the source.

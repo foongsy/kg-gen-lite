@@ -1,7 +1,15 @@
-from typing import List
+"""LLM-assisted deduplication via KMeans clustering + PydanticAI per-cluster inference.
+
+Non-Latin text support (step 3 of 3):
+    BM25 tokenization now uses character-level splitting for CJK text instead of
+    whitespace splitting, which has no word-boundary signal for Chinese/Japanese/Korean.
+    Detection is done by checking if more than 10 % of characters fall in CJK Unicode
+    ranges — a fast, dependency-free heuristic that avoids requiring jieba or similar.
+"""
+
+from typing import List, TYPE_CHECKING
 from scipy.spatial.distance import cdist
 from concurrent.futures import ThreadPoolExecutor
-import dspy
 from kg_gen.models import Graph
 import logging
 from sklearn.metrics.pairwise import cosine_similarity
@@ -9,6 +17,46 @@ from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 import numpy as np
 from sklearn.cluster import KMeans
+from pydantic import BaseModel
+from pydantic_ai import Agent
+from pydantic_ai.settings import ModelSettings
+from pydantic_ai.models.openai import OpenAIChatModelSettings
+
+from kg_gen.utils.text import is_cjk_text
+
+if TYPE_CHECKING:
+    from kg_gen.kg_gen import ModelConfig
+
+
+def _tokenize(text: str) -> list[str]:
+    """Tokenize *text* for BM25.
+
+    For CJK text each character is its own token (character-level baseline).
+    For Latin/other scripts whitespace splitting is used as before.
+    """
+    if is_cjk_text(text):
+        return [c for c in text if not c.isspace()]
+    return text.lower().split()
+
+
+# ---------------------------------------------------------------------------
+# PydanticAI deduplication models
+# ---------------------------------------------------------------------------
+
+
+class DeduplicateResponse(BaseModel):
+    """Duplicate detection result for a single item against a candidate set."""
+
+    duplicates: List[str]
+    """Exact matches to items in the candidate set that mean the same thing."""
+
+    alias: str
+    """Best name to represent the group, ideally chosen from the candidate set."""
+
+
+# ---------------------------------------------------------------------------
+# LLMDeduplicate
+# ---------------------------------------------------------------------------
 
 
 class LLMDeduplicate:
@@ -18,80 +66,87 @@ class LLMDeduplicate:
     node_clusters: list[list[str]]
     edge_clusters: list[list[str]]
     retrieval_model: SentenceTransformer
-    lm: dspy.LM
+    model_config: "ModelConfig"
 
     logger: logging.Logger = logging.getLogger(__name__)
 
-    def __init__(self, retrieval_model: SentenceTransformer, lm: dspy.LM, graph: Graph):
-        """
-        Initialize KG-assisted RAG with cached embeddings, BM25 tokens, and text chunk store.
-        """
+    def __init__(
+        self,
+        retrieval_model: SentenceTransformer,
+        model_config: "ModelConfig",
+        graph: Graph,
+    ):
         self.graph = graph
         self.nodes = list(graph.entities)
         self.edges = list(graph.edges)
-        self.node_clusters = graph.entity_clusters or []
-        self.edge_clusters = graph.edge_clusters or []
+        self.node_clusters = list(graph.entity_clusters) if graph.entity_clusters else []
+        self.edge_clusters = list(graph.edge_clusters) if graph.edge_clusters else []
         self.retrieval_model = retrieval_model
-        self.lm = lm
+        self.model_config = model_config
 
-        # Embeddings and BM25 tokens for nodes
-        self.node_embeddings = retrieval_model.encode(
-            self.nodes, show_progress_bar=True
-        )
-        self.node_bm25_tokenized = [text.lower().split() for text in self.nodes]
-
-        # Always rebuild BM25 from tokens (it's fast and simpler than serializing the object)
+        self.node_embeddings = retrieval_model.encode(self.nodes, show_progress_bar=True)
+        self.node_bm25_tokenized = [_tokenize(text) for text in self.nodes]
         self.node_bm25 = BM25Okapi(self.node_bm25_tokenized)
 
-        # Embeddings and BM25 tokens for edges
-        self.edge_embeddings = retrieval_model.encode(
-            self.edges, show_progress_bar=True
-        )
-        self.edge_bm25_tokenized = [text.lower().split() for text in self.edges]
-
-        # Always rebuild BM25 from tokens
+        self.edge_embeddings = retrieval_model.encode(self.edges, show_progress_bar=True)
+        self.edge_bm25_tokenized = [_tokenize(text) for text in self.edges]
         self.edge_bm25 = BM25Okapi(self.edge_bm25_tokenized)
 
-        dspy.configure(lm=lm)
+    def _build_dedup_agent(self, plural_type: str) -> Agent:
+        system_prompt = (
+            f"Find duplicate {plural_type} for the item against a candidate set. "
+            f"Duplicates are {plural_type} that are the same in meaning, such as with "
+            "variation in tense, plural form, stem form, case, abbreviation, or shorthand. "
+            "This includes duplicates in non-Latin scripts — judge semantic equivalence "
+            "across scripts or transliterations if present. "
+            "Return an empty duplicates list if there are none."
+        )
+        pai_model = self.model_config.build()
+        settings: ModelSettings = OpenAIChatModelSettings(
+            temperature=self.model_config.temperature,
+            max_tokens=self.model_config.max_tokens,
+            **(
+                {"openai_reasoning_effort": self.model_config.reasoning_effort}
+                if self.model_config.reasoning_effort
+                else {}
+            ),
+        )
+        return Agent(
+            pai_model,
+            output_type=DeduplicateResponse,
+            system_prompt=system_prompt,
+            model_settings=settings,
+        )
 
     def get_relevant_items(
-        self, query: str, top_k: int = 50, type: str = "node"
+        self, query: str, top_k: int = 50, item_type: str = "node"
     ) -> list[str]:
-        """
-        Use rank fusion of BM25 + embedding to retrieve top-k nodes.
-        """
-        query_tokens = query.lower().split()
+        """Rank-fusion of BM25 + embedding similarity to retrieve top-k candidates."""
+        query_tokens = _tokenize(query)
 
-        # BM25
         bm25_scores = (
             self.node_bm25.get_scores(query_tokens)
-            if type == "node"
+            if item_type == "node"
             else self.edge_bm25.get_scores(query_tokens)
         )
 
-        # Embedding
         query_embedding = self.retrieval_model.encode([query], show_progress_bar=False)
-        embeddings = self.node_embeddings if type == "node" else self.edge_embeddings
+        embeddings = self.node_embeddings if item_type == "node" else self.edge_embeddings
         embedding_scores = cosine_similarity(query_embedding, embeddings).flatten()
 
-        # Rank fusion (equal weighting)
         combined_scores = 0.5 * bm25_scores + 0.5 * embedding_scores
         top_indices = np.argsort(combined_scores)[::-1][:top_k]
-        items = self.nodes if type == "node" else self.edges
-        top_items = [items[i] for i in top_indices]
-
-        return top_items
+        items = self.nodes if item_type == "node" else self.edges
+        return [items[i] for i in top_indices]
 
     def cluster(self):
         cluster_size = 128
-
         embedding_sets = {"node": self.node_embeddings, "edge": self.edge_embeddings}
 
         for embedding_type, embeddings in embedding_sets.items():
             n_samples = len(embeddings)
             num_clusters = max(1, n_samples // cluster_size)
 
-            # Step 1: Cluster centers
             kmeans = KMeans(
                 n_clusters=num_clusters,
                 init="random",
@@ -104,11 +159,9 @@ class LLMDeduplicate:
             kmeans.fit(embeddings.astype(np.float32))
             centroids = kmeans.cluster_centers_
 
-            # Step 2: Assign each point to nearest centroid (with 25 max per cluster)
             distances = cdist(embeddings, centroids)
             assignments = np.argsort(distances, axis=1)
 
-            # Initialize cluster tracking
             clusters: List[List[int]] = [[] for _ in range(num_clusters)]
             assigned = np.zeros(n_samples, dtype=bool)
 
@@ -122,67 +175,40 @@ class LLMDeduplicate:
                         assigned[i] = True
 
             unassigned = np.where(~assigned)[0]
-
-            # Add unassigned items as their own cluster if any exist
             if len(unassigned) > 0:
                 self.logger.debug(
                     "Adding %s unassigned items as a separate cluster", len(unassigned)
                 )
                 clusters.append(unassigned.tolist())
-            else:
-                self.logger.debug("No unassigned items to add as a cluster")
 
-            # Save clusters to JSON files
-            cluster_type = embedding_type  # 'node' or 'edge'
+            self.logger.debug("Number of %s clusters: %s", embedding_type, len(clusters))
 
-            # Print debug information about clusters
-            self.logger.debug("Number of %s clusters: %s", cluster_type, len(clusters))
-            self.logger.debug("First cluster size: %s", len(clusters[0]))
-            self.logger.debug("First few items in first cluster: %s", clusters[0][:5])
-            self.logger.debug("Last cluster size: %s", len(clusters[-1]))
-            self.logger.debug(
-                "Distribution of cluster sizes: %s...",
-                [len(clust) for clust in clusters[:5]],
-            )
-
-            # Convert clusters to JSON-serializable format - save names instead of indices
-            if cluster_type == "node":
-                self.logger.debug("Converting node indices to node names...")
-                clusters_data = [
+            if embedding_type == "node":
+                self.node_clusters = [
                     [self.nodes[idx] for idx in cluster] for cluster in clusters
                 ]
-                self.logger.debug(
-                    "Sample of first cluster after conversion: %s", clusters_data[0][:3]
-                )
-                # Add node clusters to self
-                self.node_clusters = clusters_data
-            else:  # edge
-                self.logger.debug("Processing edge clusters...")
-                clusters_data = [
+            else:
+                self.edge_clusters = [
                     [self.edges[idx] for idx in cluster] for cluster in clusters
                 ]
-                self.logger.debug(
-                    "Edge clusters data is empty: %s", len(clusters_data) == 0
-                )
-                # Add edge clusters to self
-                self.edge_clusters = clusters_data
 
     def deduplicate_cluster(
-        self, cluster: list[str], type: str = "node"
-    ) -> tuple[set, dict[str, list[str]]]:
+        self, cluster: list[str], item_type: str = "node"
+    ) -> tuple[set[str], dict[str, set[str]]]:
         cluster = cluster.copy()
-
-        items = set()
-        item_clusters = {}
-        plural_type = "entities" if type == "node" else "edges"
-        singular_type = "entity" if type == "node" else "edge"
+        items: set[str] = set()
+        item_clusters: dict[str, set[str]] = {}
+        plural_type = "entities" if item_type == "node" else "edges"
+        singular_type = "entity" if item_type == "node" else "edge"
 
         self.logger.info(
             "Starting deduplication of %s %s in cluster", len(cluster), plural_type
         )
 
+        agent = self._build_dedup_agent(plural_type)
         processed_count = 0
-        while len(cluster) > 0:
+
+        while cluster:
             processed_count += 1
             item = cluster.pop()
 
@@ -194,163 +220,105 @@ class LLMDeduplicate:
                 item,
             )
 
-            relevant_items = self.get_relevant_items(item, 16, type)
+            relevant_items = self.get_relevant_items(item, 16, item_type)
 
-            self.logger.debug(
-                "  Found %s relevant %s for '%s'",
-                len(relevant_items),
-                plural_type,
-                item,
+            user_prompt = (
+                f"Item: {item}\n\n"
+                f"Candidate {plural_type} set:\n"
+                + "\n".join(f"- {it}" for it in relevant_items)
             )
-            if len(relevant_items) > 0:
-                self.logger.debug(
-                    "  Sample relevant items: %s%s",
-                    relevant_items[:3],
-                    ("..." if len(relevant_items) > 3 else ""),
-                )
 
-            class Deduplicate(dspy.Signature):
-                __doc__ = f"""Find duplicate {plural_type} for the item and an alias that best represents the duplicates. Duplicates are those that are the same in meaning, such as with variation in tense, plural form, stem form, case, abbreviation, shorthand. Return an empty list if there are none. 
-                """
-                item: str = dspy.InputField()
-                set: list[str] = dspy.InputField()
-                duplicates: list[str] = dspy.OutputField(
-                    description="Exact matches to items in {plural_type} set"
-                )
-                alias: str = dspy.OutputField(
-                    description=f"Best {singular_type} name to represent the duplicates, ideally from the {plural_type} set"
-                )
+            result = agent.run_sync(user_prompt)
+            response = result.output
+            items.add(response.alias)
 
-            # with dspy.context(lm=self.lm):
-            deduplicate = dspy.Predict(Deduplicate)
-            result = deduplicate(item=item, set=relevant_items)
-            items.add(result.alias)
+            duplicates = [dup for dup in response.duplicates if dup in cluster]
 
-            # Filter duplicates to only include those that exist in the cluster
-            duplicates = [dup for dup in result.duplicates if dup in cluster]
-
-            if len(duplicates) > 0:
-                self.logger.debug(
-                    "  ✓ Found %s duplicates for '%s'", len(duplicates), item
-                )
+            if duplicates:
                 self.logger.info(
-                    "  → Using alias '%s' to represent: '%s' and %s",
-                    result.alias,
+                    "  -> Using alias '%s' to represent: '%s' and %s",
+                    response.alias,
                     item,
                     duplicates,
                 )
-                item_clusters[result.alias] = {item}
+                item_clusters[response.alias] = {item}
                 for duplicate in duplicates:
                     cluster.remove(duplicate)
-                    item_clusters[result.alias].add(duplicate)
+                    item_clusters[response.alias].add(duplicate)
             else:
-                self.logger.debug(
-                    "  ✗ No duplicates found for '%s', keeping as is", item
-                )
-                item_clusters[item] = {item}
-
-        self.logger.debug(
-            "Deduplication complete: %s unique %s from original %s",
-            len(items),
-            plural_type,
-            processed_count,
-        )
+                self.logger.debug("  No duplicates found for '%s'", item)
+                item_clusters[response.alias] = {item}
 
         return items, item_clusters
 
     def deduplicate(self) -> Graph:
-        # Check if intermediate progress exists and load it
-        entities = set()
-        edges = set()
-        entity_clusters = {}
-        edge_clusters = {}
+        entities: set[str] = set()
+        edges: set[str] = set()
+        entity_clusters: dict[str, set[str]] = {}
+        edge_clusters: dict[str, set[str]] = {}
 
-        pool = ThreadPoolExecutor(max_workers=64)
+        # Use a context manager to ensure the executor is always shut down
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            node_futures = [
+                pool.submit(self.deduplicate_cluster, cluster, "node")
+                for cluster in self.node_clusters
+            ]
+            edge_futures = [
+                pool.submit(self.deduplicate_cluster, cluster, "edge")
+                for cluster in self.edge_clusters
+            ]
 
-        # Process node clusters in parallel
-        node_futures = []
-        cnt_nodes = 0
-        for i, cluster in enumerate(self.node_clusters):
-            cnt_nodes += len(cluster)
-            node_futures.append(pool.submit(self.deduplicate_cluster, cluster, "node"))
+            for i, future in enumerate(node_futures):
+                try:
+                    cluster_entities, cluster_entity_map = future.result()
+                    entities.update(cluster_entities)
+                    entity_clusters.update(cluster_entity_map)
+                except Exception as e:
+                    self.logger.error("Error processing node cluster %s: %s", i, e)
 
-        # Process edge clusters in parallel
-        edge_futures = []
-        cnt_edges = 0
-        for i, cluster in enumerate(self.edge_clusters):
-            cnt_edges += len(cluster)
-            edge_futures.append(pool.submit(self.deduplicate_cluster, cluster, "edge"))
+            for i, future in enumerate(edge_futures):
+                try:
+                    cluster_edges, cluster_edge_map = future.result()
+                    edges.update(cluster_edges)
+                    edge_clusters.update(cluster_edge_map)
+                except Exception as e:
+                    self.logger.error("Error processing edge cluster %s: %s", i, e)
 
-        # Collect results from node futures
-        for i, future in enumerate(node_futures):
-            try:
-                cluster_entities, cluster_entity_map = future.result()
-                entities.update(cluster_entities)
-                entity_clusters.update(cluster_entity_map)
-            except Exception as e:
-                self.logger.error("Error processing node cluster %s: %s", i, e)
-
-        # Collect results from edge futures
-        for i, future in enumerate(edge_futures):
-            try:
-                cluster_edges, cluster_edge_map = future.result()
-                edges.update(cluster_edges)
-                edge_clusters.update(cluster_edge_map)
-            except Exception as e:
-                self.logger.error("Error processing edge cluster %s: %s", i, e)
-
-        self.logger.info(
-            "Finished processing all clusters with %s nodes and %s edges LLM calls",
-            cnt_nodes,
-            cnt_edges,
-        )
-
-        # Update relations based on clusters
+        # Remap relations through deduplicated representatives
         relations: set[tuple[str, str, str]] = set()
-
         for s, p, o in self.graph.relations:
-            # Look up subject in entity clusters
             if s not in entities:
                 for rep, cluster in entity_clusters.items():
                     if s in cluster:
                         s = rep
                         break
-
-            # Look up predicate in edge clusters
             if p not in edges:
                 for rep, cluster in edge_clusters.items():
                     if p in cluster:
                         p = rep
                         break
-
-            # Look up object in entity clusters
             if o not in entities:
                 for rep, cluster in entity_clusters.items():
                     if o in cluster:
                         o = rep
                         break
-
             relations.add((s, p, o))
 
-        # Update entity_metadata keys to match deduplicated entity names
         new_entity_metadata: dict[str, set[str]] | None = None
         if self.graph.entity_metadata:
             new_entity_metadata = {}
             for original_entity, metadata_set in self.graph.entity_metadata.items():
-                # Find the deduplicated representative for this entity
                 deduped_entity = original_entity
                 for rep, cluster in entity_clusters.items():
                     if original_entity in cluster:
                         deduped_entity = rep
                         break
-                # Merge metadata sets when entities are deduplicated together
                 if deduped_entity in new_entity_metadata:
                     new_entity_metadata[deduped_entity].update(metadata_set)
                 else:
                     new_entity_metadata[deduped_entity] = metadata_set.copy()
 
-        # Create new Graph instance with deduplicated data
-        deduped_graph = Graph(
+        return Graph(
             entities=entities,
             edges=edges,
             relations=relations,
@@ -358,5 +326,3 @@ class LLMDeduplicate:
             edge_clusters=edge_clusters,
             entity_metadata=new_entity_metadata,
         )
-
-        return deduped_graph

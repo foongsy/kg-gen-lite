@@ -31,3 +31,5 @@ Follow these rules when identifying entities:
 7. **Extract each unique entity only once**: Even if an entity appears multiple times, list it only once in your final output.
 
 8. **Be selective rather than inclusive**: When uncertain about whether an entity meets the criteria (particularly regarding relationship potential), err on the side of exclusion rather than inclusion. It's better to have a focused set of well-connected entities than a comprehensive list with many isolated mentions.
+
+9. **Preserve original script**: Return entity names exactly as they appear in the source text. Do not translate, romanise, or convert between scripts (e.g. keep 北京 as 北京, not "Beijing"). If an entity appears in multiple scripts, use the form that is most prevalent in the article.
