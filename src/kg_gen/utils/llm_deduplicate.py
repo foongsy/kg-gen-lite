@@ -247,7 +247,7 @@ class LLMDeduplicate:
                     item_clusters[response.alias].add(duplicate)
             else:
                 self.logger.debug("  No duplicates found for '%s'", item)
-                item_clusters[item] = {item}
+                item_clusters[response.alias] = {item}
 
         return items, item_clusters
 
