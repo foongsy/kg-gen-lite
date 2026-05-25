@@ -26,3 +26,5 @@ experiments/MINE/faiss-scikit/scikit-learn
 experiments/MINE/faiss-scikit/*.zip
 mlruns/
 examples/wikipedia/
+notebook/.env
+notebook/output/graph.json
